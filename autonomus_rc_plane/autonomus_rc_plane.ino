@@ -1,27 +1,93 @@
+/*
+ * ------------------------------------------------------------------
+ *  RC Plane Autopilot - automatic takeoff, demo turn and landing
+ * ------------------------------------------------------------------
+ *  Board  : Arduino Uno / Nano (ATmega328P)
+ *  Wiring : D10 -> ESC signal (throttle)
+ *           D9  -> aileron servo
+ *           D11 -> elevator servo
+ *           D8  -> ultrasonic sensor TRIG
+ *           D7  -> ultrasonic sensor ECHO
+ *           GND -> common ground for all devices
+ *  Author : Swayam Khantwal (github.com/Swayam7024)
+ *  License: MIT
+ *
+ *  The flight sequence starts automatically on power-up.
+ *  ALWAYS remove the propeller when testing on the bench.
+ * ------------------------------------------------------------------
+ */
+
 #include <Servo.h>
+
+// ---------------- Pins ----------------
+const int THROTTLE_PIN = 10;   // ESC (Electronic Speed Controller) signal
+const int AILERON_PIN  = 9;    // aileron servo
+const int ELEVATOR_PIN = 11;   // elevator servo
+const int TRIG_PIN     = 8;    // ultrasonic TRIG
+const int ECHO_PIN     = 7;    // ultrasonic ECHO
+
+// ---------------- Throttle (µs) ----------------
+const int THROTTLE_OFF = 900;  // ESC minimum / motor off
+
+// ---------------- Ultrasonic ----------------
+const unsigned long ECHO_TIMEOUT_US = 30000; // ~5 m round trip; stops pulseIn() from blocking
+const int NO_ECHO_DISTANCE_CM = 500;         // value used when no echo comes back (out of range)
+
+// ---------------- Altitude limits (cm) ----------------
+const int TAKEOFF_FAIL_CM  = 20;   // still this close to the ground -> takeoff failed
+const int TAKEOFF_OK_CM    = 50;   // at or above this height -> takeoff successful
+const int LANDING_FLARE_CM = 100;  // within this height -> flare and cut throttle
+
+// ---------------- Safety timeouts (ms) ----------------
+const unsigned long TAKEOFF_CLIMB_TIMEOUT_MS = 10000; // must reach TAKEOFF_OK_CM within this time
+const unsigned long LANDING_TIMEOUT_MS       = 20000; // cut throttle anyway after this time
 
 int throttleValue;
 Servo throttle;
 Servo aileron;
 Servo elevator;
-int trig = 8;
-int echo = 7;
-int timeinmicro;
 int disincm;
-int i;
 
+// Measure the distance to the ground in centimetres.
+// Returns NO_ECHO_DISTANCE_CM if no echo is received within the timeout.
+int readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);          // HC-SR04 needs a 10 µs trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long timeinmicro = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
+  if (timeinmicro == 0) {
+    return NO_ECHO_DISTANCE_CM;   // no echo -> treat as out of range
+  }
+  return timeinmicro / 29 / 2;    // distance in centimetres
+}
+
+// Stop the motor, neutralise the control surfaces and stay there forever.
+void enterSafeIdle(const char *reason) {
+  throttle.writeMicroseconds(THROTTLE_OFF);
+  aileron.write(90);
+  elevator.write(90);
+  Serial.print("SAFE IDLE: ");
+  Serial.println(reason);
+  while (true) {
+    throttle.writeMicroseconds(THROTTLE_OFF);  // keep the motor off
+    delay(100);
+  }
+}
 
 void setup() {
   Serial.begin(9600);
 
-  throttle.attach(10);   // Connect the ESC (Electronic Speed Controller) signal wire to pin 9
-  aileron.attach(9);   // Connect aileron servo to pin 10
-  elevator.attach(11);  // Connect elevator servo to pin 11
-  pinMode(8, OUTPUT);
-  pinMode(7, INPUT);
+  throttle.attach(THROTTLE_PIN);   // ESC signal wire on pin 10
+  aileron.attach(AILERON_PIN);     // aileron servo on pin 9
+  elevator.attach(ELEVATOR_PIN);   // elevator servo on pin 11
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-  // Arm the ESC by setting the throttle to the minimum position from 700 to 2300
-  throttle.writeMicroseconds(900);
+  // Arm the ESC by setting the throttle to the minimum position
+  throttle.writeMicroseconds(THROTTLE_OFF);
   delay(4000);  // Wait for 4 seconds to allow ESC to initialize
 
   Serial.println("RC plane ready for takeoff!");
@@ -39,27 +105,24 @@ void loop() {
   elevator.write(60);
   delay(2000);
 
-  // using ultrasonic sensor for distance measurement from ground.
-
-   for (i = 0; ; i++) {
-    digitalWrite(trig, LOW);
-    delay(20);
-    digitalWrite(trig, HIGH);
-    delay(100);
-    digitalWrite(trig, LOW);
-
-    timeinmicro = pulseIn(echo, HIGH);
-    disincm = timeinmicro / 29 / 2;     // distance is stored in (disincm) in centimeter.
+  // Use the ultrasonic sensor to check the height above the ground.
+  unsigned long climbStart = millis();
+  while (true) {
+    disincm = readDistanceCm();
     Serial.println(disincm);
- 
-    if (disincm <= 20) {       // if plane fails to takeoff then the throttle will be reduced to (0%)
-      throttle.writeMicroseconds(900);
-    } else if (disincm >= 50) {
-      break;
-   }
+
+    if (disincm <= TAKEOFF_FAIL_CM) {
+      // Plane failed to take off -> throttle to 0 % and stop the sequence
+      enterSafeIdle("takeoff failed (too close to the ground)");
+    } else if (disincm >= TAKEOFF_OK_CM) {
+      break;  // takeoff successful
+    }
+
+    if (millis() - climbStart > TAKEOFF_CLIMB_TIMEOUT_MS) {
+      enterSafeIdle("takeoff failed (did not climb in time)");
+    }
+    delay(60);  // let the previous echo die out before the next measurement
   }
-  
-  
 
   // Adjust aileron and elevator for stabilization after takeoff
   aileron.write(90);    // Set aileron to neutral position
@@ -96,44 +159,34 @@ void loop() {
     Serial.println(throttleValue);
   }
 
-    // Increase elevator angle for landing
-    elevator.write(90);
-    delay(500);
-    elevator.write(60);
-    delay(1000);
-    elevator.write(90);
-    delay(500);
+  // Increase elevator angle for landing
+  elevator.write(90);
+  delay(500);
+  elevator.write(60);
+  delay(1000);
+  elevator.write(90);
+  delay(500);
 
-    // If altitude is low, reduce throttle and elevator angle
-     for (i = 0; ; i++) {
-    digitalWrite(trig, LOW);
-    delay(20);
-    digitalWrite(trig, HIGH);
-    delay(100);
-    digitalWrite(trig, LOW);
-
-    timeinmicro = pulseIn(echo, HIGH);
-    disincm = timeinmicro / 29 / 2;     // distance is stored in (disincm) in centimeter.
-    Serial.println(disincm);
-     
-    if (disincm <= 100) {
-       elevator.write(60);
-       throttle.writeMicroseconds(900);
-       delay(500);
-    }
-    else if (disincm >= 50) {
-      break;
-     }
-     }
-      elevator.write(90);
-  
-
-  // Set throttle to idle
-  throttle.writeMicroseconds(900);
-
-  // Loop indefinitely
+  // Wait until the plane is low, then flare (elevator up) and cut the throttle.
+  unsigned long landingStart = millis();
   while (true) {
-  }
-}
+    disincm = readDistanceCm();
+    Serial.println(disincm);
 
-  
+    if (disincm <= LANDING_FLARE_CM) {
+      elevator.write(60);
+      throttle.writeMicroseconds(THROTTLE_OFF);
+      delay(500);
+      break;  // flare done
+    }
+
+    if (millis() - landingStart > LANDING_TIMEOUT_MS) {
+      Serial.println("Landing timeout - cutting throttle.");
+      break;
+    }
+    delay(60);
+  }
+
+  // Landing finished: motor off, surfaces neutral, stay here.
+  enterSafeIdle("landing complete");
+}
